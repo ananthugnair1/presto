@@ -16,6 +16,7 @@ package com.facebook.presto.spi;
 import com.facebook.presto.common.ErrorCode;
 import com.facebook.presto.common.ErrorType;
 
+import static com.facebook.presto.common.ErrorType.EXTERNAL;
 import static com.facebook.presto.common.ErrorType.INSUFFICIENT_RESOURCES;
 import static com.facebook.presto.common.ErrorType.INTERNAL_ERROR;
 import static com.facebook.presto.common.ErrorType.USER_ERROR;
@@ -114,6 +115,12 @@ public enum StandardErrorCode
     QUERY_PLANNING_TIMEOUT(0x0001_0027, INTERNAL_ERROR),
     NATIVE_EXECUTION_TASK_ERROR(0x0001_0028, INTERNAL_ERROR),
     UNSUPPORTED_ANALYZER_TYPE(0x0001_0029, INTERNAL_ERROR),
+    KEY_MANAGEMENT_ERROR(0x0001_002A, EXTERNAL),
+    KEYSTORE_OPERATION_ERROR(0x0001_002B, EXTERNAL),
+    CRYPT_ALGORITHM_ERROR(0x0001_002C, EXTERNAL),
+    CERT_PARSE_ERROR(0x0001_002D, EXTERNAL),
+    PEER_VERIFY_ERROR(0x0001_002E, EXTERNAL),
+    SSL_HANDSHAKE_ERROR(0x0001_002F, EXTERNAL),
     SLICE_TOO_LARGE(0x0001_002A, INTERNAL_ERROR),
     HBO_FAILURE(0x0001_002B, INTERNAL_ERROR),
 
