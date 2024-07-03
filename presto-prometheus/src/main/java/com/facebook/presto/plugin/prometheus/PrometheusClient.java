@@ -28,12 +28,25 @@ import okhttp3.Request;
 import okhttp3.Response;
 
 import javax.inject.Inject;
+import javax.net.ssl.HostnameVerifier;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLHandshakeException;
+import javax.net.ssl.SSLPeerUnverifiedException;
+import javax.net.ssl.SSLSession;
+import javax.net.ssl.TrustManagerFactory;
+import javax.net.ssl.X509TrustManager;
 
 import java.io.File;
 import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.net.URL;
 import java.nio.file.Files;
+import java.security.KeyManagementException;
+import java.security.KeyStore;
+import java.security.KeyStoreException;
+import java.security.NoSuchAlgorithmException;
+import java.security.cert.CertificateException;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -44,6 +57,12 @@ import static com.facebook.presto.common.type.VarcharType.VARCHAR;
 import static com.facebook.presto.plugin.prometheus.PrometheusColumn.mapType;
 import static com.facebook.presto.plugin.prometheus.PrometheusErrorCode.PROMETHEUS_TABLES_METRICS_RETRIEVE_ERROR;
 import static com.facebook.presto.plugin.prometheus.PrometheusErrorCode.PROMETHEUS_UNKNOWN_ERROR;
+import static com.facebook.presto.spi.StandardErrorCode.CERT_PARSE_ERROR;
+import static com.facebook.presto.spi.StandardErrorCode.CRYPT_ALGORITHM_ERROR;
+import static com.facebook.presto.spi.StandardErrorCode.KEYSTORE_OPERATION_ERROR;
+import static com.facebook.presto.spi.StandardErrorCode.KEY_MANAGEMENT_ERROR;
+import static com.facebook.presto.spi.StandardErrorCode.PEER_VERIFY_ERROR;
+import static com.facebook.presto.spi.StandardErrorCode.SSL_HANDSHAKE_ERROR;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
@@ -57,12 +76,14 @@ public class PrometheusClient
     private final Optional<File> bearerTokenFile;
     private final Supplier<Map<String, Object>> tableSupplier;
     private final Type varcharMapType;
+    private PrometheusConnectorConfig config;
 
     private static final Logger log = Logger.get(PrometheusClient.class);
 
     @Inject
     public PrometheusClient(PrometheusConnectorConfig config, JsonCodec<Map<String, Object>> metricCodec, TypeManager typeManager)
     {
+        this.config = config;
         requireNonNull(config, "config is null");
         requireNonNull(metricCodec, "metricCodec is null");
         requireNonNull(typeManager, "typeManager is null");
@@ -148,16 +169,60 @@ public class PrometheusClient
     {
         Request.Builder requestBuilder = new Request.Builder().url(uri.toString());
         getBearerAuthInfoFromFile().map(bearerToken -> requestBuilder.header("Authorization", "Bearer " + bearerToken));
-
         Response response;
         try {
-            response = httpClient.newCall(requestBuilder.build()).execute();
-            if (response.isSuccessful() && response.body() != null) {
-                return response.body().bytes();
+            if (config.isTlsEnabled()) {
+                OkHttpClient httpClient;
+                HostnameVerifier hostnameVerifier = new HostnameVerifier() {
+                    @Override
+                    public boolean verify(String hostname, SSLSession session)
+                    {
+                        // Always return true to accept any hostname
+                        return true;
+                    }
+                };
+                if (!config.getVerifyHostName()) {
+                    httpClient = new OkHttpClient.Builder()
+                            .hostnameVerifier(hostnameVerifier)
+                            .sslSocketFactory(getSSLContext().getSocketFactory(), (X509TrustManager) getTrustManagerFactory().getTrustManagers()[0])
+                            .build();
+                }
+                else {
+                    httpClient = new OkHttpClient.Builder()
+                            .sslSocketFactory(getSSLContext().getSocketFactory(), (X509TrustManager) getTrustManagerFactory().getTrustManagers()[0])
+                            .build();
+                }
+                response = httpClient.newCall(requestBuilder.build()).execute();
+                if (response.isSuccessful() && response.body() != null) {
+                    return response.body().bytes();
+                }
             }
+            else {
+                response = httpClient.newCall(requestBuilder.build()).execute();
+                if (response.isSuccessful() && response.body() != null) {
+                    return response.body().bytes();
+                }
+            }
+        }
+        catch (SSLHandshakeException e) {
+            throw new PrestoException(SSL_HANDSHAKE_ERROR, "An SSL handshake error occurred while establishing a secure connection. Try the following measures to resolve the error:\n\n" + "- Upload a valid SSL certificate for authentication\n- Verify the expiration status of the uploaded certificate.\n- If you are connecting with SSL, enable SSL on both ends of the connection.\n");
+        }
+        catch (SSLPeerUnverifiedException e) {
+            throw new PrestoException(PEER_VERIFY_ERROR, "Peer verification failed.Below measures may resolve the issue \n" +
+                    "- Add correct Hostname in the SSL certificate's SAN list \n" +
+                    "- The certificate chain might be incomplete. Please check your SSL certificate\n");
         }
         catch (IOException e) {
             throw new PrestoException(PROMETHEUS_UNKNOWN_ERROR, "Error reading metrics", e);
+        }
+        catch (NoSuchAlgorithmException e) {
+            throw new PrestoException(CRYPT_ALGORITHM_ERROR, "Requested cryptographic algorithm is not available", e);
+        }
+        catch (KeyStoreException e) {
+            throw new PrestoException(KEYSTORE_OPERATION_ERROR, "Keystore operation error", e);
+        }
+        catch (KeyManagementException e) {
+            throw new PrestoException(KEY_MANAGEMENT_ERROR, "Key management operation error", e);
         }
 
         throw new PrestoException(PROMETHEUS_UNKNOWN_ERROR, "Bad response " + response.code() + response.message());
@@ -173,5 +238,34 @@ public class PrometheusClient
                 throw new PrestoException(PROMETHEUS_UNKNOWN_ERROR, "Failed to read bearer token file: " + tokenFileName, e);
             }
         });
+    }
+
+    public SSLContext getSSLContext()
+            throws NoSuchAlgorithmException, KeyStoreException, KeyManagementException
+    {
+        SSLContext sslContext = SSLContext.getInstance("TLS");
+        sslContext.init(null, getTrustManagerFactory().getTrustManagers(), new java.security.SecureRandom());
+        return sslContext;
+    }
+
+    public TrustManagerFactory getTrustManagerFactory()
+            throws KeyStoreException, NoSuchAlgorithmException
+    {
+        KeyStore truststore = KeyStore.getInstance(KeyStore.getDefaultType());
+        try {
+            truststore.load(new URL("file://" + config.getTrustStorePath()).openStream(), config.getTruststorePassword().toCharArray());
+        }
+        catch (IOException e) {
+            throw new PrestoException(PROMETHEUS_UNKNOWN_ERROR, "I/O Error", e);
+        }
+        catch (NoSuchAlgorithmException e) {
+            throw new PrestoException(CRYPT_ALGORITHM_ERROR, "Requested cryptographic algorithm is not available", e);
+        }
+        catch (CertificateException e) {
+            throw new PrestoException(CERT_PARSE_ERROR, "Error while parsing or validating the certificate", e);
+        }
+        TrustManagerFactory trustManagerFactory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+        trustManagerFactory.init(truststore);
+        return trustManagerFactory;
     }
 }
